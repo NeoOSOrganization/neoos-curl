@@ -108,3 +108,70 @@ else
     echo "ERROR: build finished but libcurl.a not found" >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------------
+# The curl CLI: hand-linked. CMake's own executable target does not
+# know about NeoOS's user.ld linker script or crt1.o and would fail
+# (or silently produce something that will not run) if asked to build
+# it -- BUILD_CURL_EXE=OFF above skips that entirely. This mirrors how
+# neoos-libssh2's own SFTP/exec test programs were hand-linked against
+# libssh2.a.
+#
+# Source list is curl-8_22_0's src/Makefile.inc, read directly rather
+# than asked of CMake: CURL_CFILES (40 files in src/), plus
+# toolx/tool_time.c, plus the 16 lib/curlx/*.c files the CLI reuses
+# directly (curlx_* functions are internal to libcurl, not part of its
+# public API, so the CLI compiles its own copy rather than linking
+# against symbols libcurl.a does not export).
+CLI_SRCS=""
+for f in config2setopts slist_wc terminal tool_cb_dbg tool_cb_hdr \
+         tool_cb_prg tool_cb_rea tool_cb_see tool_cb_soc tool_cb_wrt \
+         tool_cfgable tool_dirhie tool_doswin tool_easysrc tool_filetime \
+         tool_findfile tool_formparse tool_getparam tool_getpass tool_help \
+         tool_helpers tool_ipfs tool_libinfo tool_listhelp tool_main tool_msgs \
+         tool_operate tool_operhlp tool_paramhlp tool_parsecfg tool_progress \
+         tool_setopt tool_ssls tool_stderr tool_urlglob tool_util tool_vms \
+         tool_writeout tool_writeout_json tool_xattr var; do
+    CLI_SRCS="$CLI_SRCS $UPSTREAM_DIR/src/$f.c"
+done
+CLI_SRCS="$CLI_SRCS $UPSTREAM_DIR/src/toolx/tool_time.c"
+for f in base64 basename dynbuf fopen multibyte nonblock strcopy strdup \
+         strerr strparse timediff timeval version_win32 wait warnless winapi; do
+    CLI_SRCS="$CLI_SRCS $UPSTREAM_DIR/lib/curlx/$f.c"
+done
+
+echo ""
+echo "Linking curl CLI..."
+x86_64-elf-gcc -static -nostdlib -nostdinc -ffreestanding \
+    -mcmodel=large -fno-pic -mno-red-zone -fno-stack-protector -O2 \
+    -ffunction-sections -fdata-sections \
+    -isystem "$ABS_MUSL_DIR/include" \
+    -isystem "$ABS_OPENSSL_DIR/include" \
+    -isystem "$ABS_LIBSSH2_DIR/include" \
+    -I"$(pwd)/$UPSTREAM_DIR/include" \
+    -I"$(pwd)/$UPSTREAM_DIR/lib" \
+    -I"$(pwd)/$UPSTREAM_DIR/lib/curlx" \
+    -I"$(pwd)/$UPSTREAM_DIR/src" \
+    -I"$(pwd)/$BUILD_TMP/lib" \
+    -DHAVE_CONFIG_H \
+    -DCURL_STATICLIB \
+    -T user.ld -z noexecstack -Wl,--gc-sections \
+    -o "$ABS_PREFIX/bin/curl.elf" \
+    "$ABS_MUSL_DIR/lib/crt1.o" $CLI_SRCS \
+    -Wl,--start-group \
+    -L"$ABS_PREFIX/lib" -lcurl \
+    -L"$ABS_LIBSSH2_DIR/lib" -lssh2 \
+    -L"$ABS_OPENSSL_DIR/lib" -lssl -lcrypto \
+    -Wl,--end-group \
+    -L"$ABS_MUSL_DIR/lib" -lc -lgcc -lm
+mkdir -p "$ABS_PREFIX/bin"
+cp "$ABS_PREFIX/bin/curl.elf" "$ABS_PREFIX/bin/curl.nex"
+
+if [ -f "$PREFIX/bin/curl.nex" ]; then
+    echo ""
+    echo "OK curl CLI linked successfully at $PREFIX/bin/curl.nex"
+    ls -lh "$PREFIX/bin/curl.nex"
+else
+    echo "ERROR: build finished but curl.nex not found" >&2
+    exit 1
+fi
