@@ -44,6 +44,56 @@ rm -rf "$BUILD_TMP"
 # unavailable regardless of what musl actually provides -- exactly the
 # false negative that broke libssh2 the first time it was built here.
 #
+# HAVE_EVENTFD=0 is a deliberate override, not a missing feature this
+# needs fixing later: musl provides a real eventfd() WRAPPER FUNCTION
+# (it links fine, so check_function_exists("eventfd") reports true),
+# but NeoOS's shim does not implement the eventfd2 syscall underneath
+# it -- calling it fails at runtime with ENOSYS, which surfaced as
+# curl's own generic "(27) Out of memory" from lib/socketpair.c's
+# wakeup_eventfd() failing. This is the mirror image of the
+# HAVE_O_NONBLOCK problem libssh2 hit: there, a probe FALSE NEGATIVE
+# hid a capability NeoOS genuinely has; here, a probe FALSE POSITIVE
+# claims one it does not, because check_function_exists can only prove
+# a symbol resolves, never that calling it actually works, and no
+# cross-compile probe can run the target's kernel to find out. Forcing
+# HAVE_EVENTFD off makes curl's own multi-handle wakeup fall through
+# to HAVE_PIPE's pipe2()-based implementation (lib/socketpair.c) --
+# NeoOS's real, working, already-tested pipe2 -- instead of adding
+# eventfd2 as a THIRD kernel primitive for a pure optimization curl
+# itself treats as an optional fast path over an equivalent fallback.
+#
+# ENABLE_THREADED_RESOLVER=OFF: curl's default async resolver (the
+# only other option here, since c-ares is not ported) spawns a pthread
+# per lookup and synchronizes it back to the transfer via a
+# socketpair/pipe wakeup -- a real DNS lookup (curl -v http://example.com)
+# hung forever with it on, with zero output even under -v, pointing at
+# that cross-thread handoff rather than resolution itself (a raw-IP
+# request, which never touches the resolver at all, connects and fails
+# normally). Rather than debug a second cross-thread synchronization
+# path this session already spent real effort proving correct for a
+# more essential case (libssh2's poll()), this switches curl to its
+# synchronous resolver (CURLRES_SYNCH, still a fully supported mode in
+# 8.22.0): a direct getaddrinfo() call on the transfer's own thread --
+# exactly the call already proven working end-to-end in the DNS
+# milestone. The right engineering trade for a CLI tool that mostly
+# fetches one URL per invocation, where the threaded resolver's real
+# benefit (not blocking OTHER concurrent transfers on the same
+# multi-handle) does not apply.
+#
+# HAVE_ALARM=0 is the same false-positive class as HAVE_EVENTFD above:
+# musl provides a real alarm() wrapper (links fine), but it calls
+# setitimer() underneath, which NeoOS's shim does not implement --
+# ENOSYS at runtime, immediately after a real DNS lookup, from the
+# synchronous resolver's alarm()+sigsetjmp/siglongjmp DNS-timeout
+# mechanism (USE_ALARM_TIMEOUT, lib/vdns/hostip.c -- gated behind
+# HAVE_ALARM && HAVE_SIGSETJMP && ...). This is a legacy fallback for
+# platforms with no better way to bound a blocking resolver call; the
+# getaddrinfo() call itself is already proven fast and reliable (the
+# DNS milestone), so no timeout enforcement here is a fine trade
+# against implementing a fourth kernel-level primitive (real interval
+# timers + SIGALRM delivery) for a mechanism curl itself treats as a
+# fallback of a fallback.
+#
 # BUILD_CURL_EXE=OFF is deliberate: CMake's own attempt to link the
 # curl executable does not know about NeoOS's user.ld linker script or
 # crt1.o, and would fail (or silently produce something that will not
@@ -92,7 +142,10 @@ cmake -S "$UPSTREAM_DIR" -B "$BUILD_TMP" \
     -DCURL_DISABLE_WEBSOCKETS=ON \
     -DCURL_DISABLE_IPFS=ON \
     -DCURL_ENABLE_SMB=OFF \
-    -DCURL_DISABLE_DOH=ON
+    -DCURL_DISABLE_DOH=ON \
+    -DHAVE_EVENTFD=0 \
+    -DENABLE_THREADED_RESOLVER=OFF \
+    -DHAVE_ALARM=0
 
 cmake --build "$BUILD_TMP" --target libcurl_static -j"$(nproc)"
 cmake --install "$BUILD_TMP"
@@ -166,6 +219,15 @@ x86_64-elf-gcc -static -nostdlib -nostdinc -ffreestanding \
     -L"$ABS_MUSL_DIR/lib" -lc -lgcc -lm
 mkdir -p "$ABS_PREFIX/bin"
 cp "$ABS_PREFIX/bin/curl.elf" "$ABS_PREFIX/bin/curl.nex"
+
+# ALSO at the top level of $PREFIX, not just bin/: neoos-kernel's
+# PORT_DIRS install step (Makefile) only scans a port's build output
+# one level deep for *.nex files -- every earlier CMake-based port
+# (libssh2, OpenSSL) built a library only, with nothing living in a
+# bin/ subdirectory, so this never came up before curl. bin/curl.nex
+# stays too, matching the CMake-conventional bin/lib/include layout
+# for anyone building this repo by hand.
+cp "$ABS_PREFIX/bin/curl.elf" "$ABS_PREFIX/curl.nex"
 
 if [ -f "$PREFIX/bin/curl.nex" ]; then
     echo ""
